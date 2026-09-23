@@ -6,37 +6,37 @@ use todo::TodoList;
 use directories::ProjectDirs;
 use smallvec::smallvec;
 use vulkano::{
+    VulkanLibrary,
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage},
     command_buffer::{
-        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
         AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo,
+        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
     },
     device::{
-        physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, Queue,
-        QueueCreateInfo, QueueFlags,
+        Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
+        physical::PhysicalDeviceType,
     },
-    image::{view::ImageView, ImageUsage},
+    image::{ImageUsage, view::ImageView},
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
+        GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
         graphics::{
+            GraphicsPipelineCreateInfo,
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
             rasterization::RasterizationState,
             vertex_input::{Vertex, VertexDefinition},
             viewport::{Viewport, ViewportState},
-            GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
     },
     render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
     swapchain::{
-        acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
+        Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo, acquire_next_image,
     },
     sync::{self, GpuFuture},
-    VulkanLibrary,
 };
 use winit::{
     application::ApplicationHandler,

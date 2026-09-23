@@ -17,7 +17,7 @@ use vulkano::{
         physical::PhysicalDeviceType,
     },
     image::{ImageUsage, view::ImageView},
-    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
+    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
         GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
@@ -163,7 +163,7 @@ impl App {
         println!("Enabling instance extensions: {:?}", enabled_extensions);
 
         let instance = Instance::new(
-            library,
+            &library,
             InstanceCreateInfo {
                 flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
                 enabled_extensions,
@@ -230,7 +230,7 @@ impl App {
                     queue_family_index,
                     ..Default::default()
                 }],
-                enabled_extensions: device_extensions,
+                enabled_extensions: &device_extensions,
                 ..Default::default()
             },
         )
@@ -301,7 +301,7 @@ impl App {
             .unwrap();
             let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
             GraphicsPipeline::new(
-                device.clone(),
+                &device.clone(),
                 None,
                 GraphicsPipelineCreateInfo {
                     stages: stages.into_iter().collect(),
@@ -537,11 +537,11 @@ impl ApplicationHandler for App {
                     let fbs = new_images
                         .iter()
                         .map(|img| {
-                            let view = ImageView::new_default(img.clone()).unwrap();
+                            let view = ImageView::new_default(&img.clone()).unwrap();
                             Framebuffer::new(
                                 render_pass.clone(),
                                 FramebufferCreateInfo {
-                                    attachments: vec![view],
+                                    attachments: &[&view],
                                     ..Default::default()
                                 },
                             )

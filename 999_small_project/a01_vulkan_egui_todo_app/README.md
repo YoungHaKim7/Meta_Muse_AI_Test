@@ -39,6 +39,12 @@ src/
 Cargo.toml
 ```
 
+# Install Dependencies
+
+```bash
+brew install molten-vk vulkan-loader
+```
+
 ## Why Vulkan for a Todo?
 
 1. Learn Vulkan without writing 2000 lines of raw ash code

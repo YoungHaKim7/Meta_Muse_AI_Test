@@ -85,7 +85,7 @@ mod fs {
 }
 
 struct App {
-    instance: Arc<Instance>,
+    instance: Option<Arc<Instance>>,
     device: Option<Arc<Device>>,
     queue: Option<Arc<Queue>>,
     surface: Option<Arc<Surface>>,
@@ -107,24 +107,6 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        // Instance will be created in init_vulkan with proper surface extensions for macOS
-        // We create a dummy placeholder that will be replaced
-        let library = VulkanLibrary::new().unwrap();
-        let instance = Instance::new(
-            library.clone(),
-            InstanceCreateInfo {
-                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
-                enabled_extensions: vulkano::instance::InstanceExtensions {
-                    khr_surface: true,
-                    ext_metal_surface: true,
-                    khr_portability_enumeration: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
         let data_path = if let Some(proj) = ProjectDirs::from("com", "example", "vulkan-todo") {
             let dir = proj.data_local_dir();
             std::fs::create_dir_all(dir).ok();
@@ -135,7 +117,7 @@ impl App {
         let todo_list = TodoList::load_from_file(&data_path);
 
         Self {
-            instance,
+            instance: None,
             device: None,
             queue: None,
             surface: None,
@@ -157,20 +139,28 @@ impl App {
     }
 
     fn init_vulkan(&mut self, event_loop: &ActiveEventLoop) {
-        // Fix for macOS: need ext_metal_surface extension
-        // Recreate instance with required surface extensions from winit
-        let library = VulkanLibrary::new().unwrap();
-        let required_extensions = Surface::required_extensions(event_loop).unwrap_or_else(|_| {
-            // Fallback for when required_extensions fails: manually enable common surface extensions
-            let mut ext = vulkano::instance::InstanceExtensions::empty();
-            ext.khr_surface = true;
-            ext.ext_metal_surface = true;
-            ext.khr_portability_enumeration = true;
-            ext
-        });
-        // Also ensure portability enumeration is set for MoltenVK
+        // macOS MoltenVK fix: get required extensions from winit
+        let library = VulkanLibrary::new().expect("Failed to load Vulkan library");
+
+        let required_extensions = Surface::required_extensions(event_loop).unwrap_or_default();
+
+        // Check what the library actually supports
+        let supported_extensions = library.supported_extensions();
+
+        // Start with required extensions
         let mut enabled_extensions = required_extensions;
-        enabled_extensions.khr_portability_enumeration = true;
+        // Add portability enumeration for MoltenVK if supported
+        if supported_extensions.khr_portability_enumeration {
+            enabled_extensions.khr_portability_enumeration = true;
+        }
+        if supported_extensions.ext_metal_surface {
+            enabled_extensions.ext_metal_surface = true;
+        }
+
+        // Only keep extensions that are supported
+        let enabled_extensions = enabled_extensions.intersection(&supported_extensions);
+
+        println!("Enabling instance extensions: {:?}", enabled_extensions);
 
         let instance = Instance::new(
             library,
@@ -180,8 +170,7 @@ impl App {
                 ..Default::default()
             },
         )
-        .unwrap();
-        self.instance = instance;
+        .expect("Failed to create Vulkan instance - try: brew install molten-vk");
 
         let window = Arc::new(
             event_loop
@@ -197,13 +186,21 @@ impl App {
                 .unwrap(),
         );
         self.window = Some(window.clone());
-        let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
+
+        let surface = Surface::from_window(instance.clone(), window.clone())
+            .expect("Failed to create surface - check MoltenVK installation");
+
+        self.instance = Some(instance.clone());
+
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
             ..DeviceExtensions::empty()
         };
+
         let (physical_device, queue_family_index) = self
             .instance
+            .as_ref()
+            .unwrap()
             .enumerate_physical_devices()
             .unwrap()
             .filter(|p| p.supported_extensions().contains(&device_extensions))
@@ -222,12 +219,10 @@ impl App {
                 PhysicalDeviceType::IntegratedGpu => 1,
                 _ => 2,
             })
-            .unwrap();
+            .expect("No suitable Vulkan device found");
 
-        println!(
-            "Vulkan device: {}",
-            physical_device.properties().device_name
-        );
+        println!("Using device: {}", physical_device.properties().device_name);
+
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
@@ -241,11 +236,13 @@ impl App {
         )
         .unwrap();
         let queue = queues.next().unwrap();
+
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
             StandardCommandBufferAllocatorCreateInfo::default(),
         ));
+
         let caps = device
             .physical_device()
             .surface_capabilities(&surface, Default::default())
@@ -255,6 +252,7 @@ impl App {
             .surface_formats(&surface, Default::default())
             .unwrap()[0]
             .0;
+
         let (swapchain, images) = Swapchain::new(
             device.clone(),
             surface.clone(),
@@ -288,6 +286,7 @@ impl App {
 
         let vs = vs::load(device.clone()).unwrap();
         let fs = fs::load(device.clone()).unwrap();
+
         let pipeline = {
             let stages = [
                 PipelineShaderStageCreateInfo::new(vs.entry_point("main").unwrap()),

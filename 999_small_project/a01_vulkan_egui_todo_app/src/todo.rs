@@ -7,20 +7,6 @@ pub struct TodoItem {
     pub text: String,
     pub done: bool,
     pub created_at: DateTime<Local>,
-    pub priority: Priority,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Priority {
-    Low,
-    Medium,
-    High,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 impl TodoItem {
@@ -30,7 +16,6 @@ impl TodoItem {
             text,
             done: false,
             created_at: Local::now(),
-            priority: Priority::default(),
         }
     }
 }
@@ -48,7 +33,6 @@ impl TodoList {
             next_id: 1,
         }
     }
-
     pub fn add(&mut self, text: String) {
         if text.trim().is_empty() {
             return;
@@ -56,27 +40,22 @@ impl TodoList {
         self.items.push(TodoItem::new(self.next_id, text));
         self.next_id += 1;
     }
-
-    pub fn toggle(&mut self, id: u64) {
-        if let Some(item) = self.items.iter_mut().find(|i| i.id == id) {
+    pub fn toggle(&mut self, idx: usize) {
+        if let Some(item) = self.items.get_mut(idx) {
             item.done = !item.done;
         }
     }
-
-    pub fn remove(&mut self, id: u64) {
-        self.items.retain(|i| i.id != id);
+    pub fn remove(&mut self, idx: usize) {
+        if idx < self.items.len() {
+            self.items.remove(idx);
+        }
     }
-
-    pub fn clear_completed(&mut self) {
-        self.items.retain(|i| !i.done);
-    }
-
     pub fn stats(&self) -> (usize, usize) {
-        let total = self.items.len();
-        let done = self.items.iter().filter(|i| i.done).count();
-        (total, done)
+        (
+            self.items.len(),
+            self.items.iter().filter(|i| i.done).count(),
+        )
     }
-
     pub fn load_from_file(path: &std::path::Path) -> Self {
         if let Ok(data) = std::fs::read_to_string(path) {
             if let Ok(items) = serde_json::from_str::<Vec<TodoItem>>(&data) {
@@ -86,7 +65,6 @@ impl TodoList {
         }
         Self::new()
     }
-
     pub fn save_to_file(&self, path: &std::path::Path) {
         if let Ok(json) = serde_json::to_string_pretty(&self.items) {
             let _ = std::fs::write(path, json);

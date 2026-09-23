@@ -1,52 +1,129 @@
 mod todo;
 
-use egui::{CentralPanel, Color32, Context, RichText, ScrollArea};
-use egui_winit_vulkano::{Gui, GuiConfig};
 use std::sync::Arc;
+use todo::TodoList;
+
+use directories::ProjectDirs;
+use smallvec::smallvec;
 use vulkano::{
-    swapchain::PresentMode,
+    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage},
+    command_buffer::{
+        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
+        AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo,
+    },
+    device::{
+        physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, Queue,
+        QueueCreateInfo, QueueFlags,
+    },
+    image::{view::ImageView, ImageUsage},
+    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
+    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    pipeline::{
+        graphics::{
+            color_blend::{ColorBlendAttachmentState, ColorBlendState},
+            input_assembly::InputAssemblyState,
+            multisample::MultisampleState,
+            rasterization::RasterizationState,
+            vertex_input::{Vertex, VertexDefinition},
+            viewport::{Viewport, ViewportState},
+            GraphicsPipelineCreateInfo,
+        },
+        layout::PipelineDescriptorSetLayoutCreateInfo,
+        GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+    },
+    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
+    swapchain::{
+        acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
+    },
     sync::{self, GpuFuture},
-};
-use vulkano_util::{
-    context::{VulkanoConfig, VulkanoContext},
-    window::{VulkanoWindows, WindowDescriptor},
+    VulkanLibrary,
 };
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 
-use directories::ProjectDirs;
-use todo::{Priority, TodoList};
-
-struct App {
-    context: VulkanoContext,
-    windows: VulkanoWindows,
-    gui: Option<Gui>,
-    todo_list: TodoList,
-    input_text: String,
-    filter: Filter,
-    data_path: std::path::PathBuf,
-    recreate_swapchain: bool,
-    previous_frame_end: Option<Box<dyn GpuFuture>>,
+#[derive(BufferContents, Vertex, Clone, Copy)]
+#[repr(C)]
+struct MyVertex {
+    #[format(R32G32_SFLOAT)]
+    position: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    color: [f32; 3],
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum Filter {
-    #[default]
-    All,
-    Active,
-    Completed,
+mod vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        src: r"
+            #version 450
+            layout(location = 0) in vec2 position;
+            layout(location = 1) in vec3 color;
+            layout(location = 0) out vec3 out_color;
+            void main() {
+                gl_Position = vec4(position, 0.0, 1.0);
+                out_color = color;
+            }
+        ",
+    }
+}
+mod fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        src: r"
+            #version 450
+            layout(location = 0) in vec3 in_color;
+            layout(location = 0) out vec4 f_color;
+            void main() {
+                f_color = vec4(in_color, 1.0);
+            }
+        ",
+    }
+}
+
+struct App {
+    instance: Arc<Instance>,
+    device: Option<Arc<Device>>,
+    queue: Option<Arc<Queue>>,
+    surface: Option<Arc<Surface>>,
+    swapchain: Option<Arc<Swapchain>>,
+    swapchain_images: Option<Vec<Arc<vulkano::image::Image>>>,
+    render_pass: Option<Arc<RenderPass>>,
+    framebuffers: Vec<Arc<Framebuffer>>,
+    pipeline: Option<Arc<GraphicsPipeline>>,
+    command_buffer_allocator: Option<Arc<StandardCommandBufferAllocator>>,
+    memory_allocator: Option<Arc<StandardMemoryAllocator>>,
+    recreate_swapchain: bool,
+    previous_frame_end: Option<Box<dyn GpuFuture>>,
+    todo_list: TodoList,
+    input_text: String,
+    selected: usize,
+    data_path: std::path::PathBuf,
+    window: Option<Arc<Window>>,
 }
 
 impl App {
     fn new() -> Self {
-        // VulkanoContext::new takes VulkanoConfig, not Instance directly
-        let context = VulkanoContext::new(VulkanoConfig::default());
-
-        let windows = VulkanoWindows::default();
+        // Instance will be created in init_vulkan with proper surface extensions for macOS
+        // We create a dummy placeholder that will be replaced
+        let library = VulkanLibrary::new().unwrap();
+        let instance = Instance::new(
+            library.clone(),
+            InstanceCreateInfo {
+                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                enabled_extensions: vulkano::instance::InstanceExtensions {
+                    khr_surface: true,
+                    ext_metal_surface: true,
+                    khr_portability_enumeration: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let data_path = if let Some(proj) = ProjectDirs::from("com", "example", "vulkan-todo") {
             let dir = proj.data_local_dir();
@@ -55,271 +132,539 @@ impl App {
         } else {
             std::path::PathBuf::from("todos.json")
         };
-
         let todo_list = TodoList::load_from_file(&data_path);
 
         Self {
-            context,
-            windows,
-            gui: None,
+            instance,
+            device: None,
+            queue: None,
+            surface: None,
+            swapchain: None,
+            swapchain_images: None,
+            render_pass: None,
+            framebuffers: Vec::new(),
+            pipeline: None,
+            command_buffer_allocator: None,
+            memory_allocator: None,
+            recreate_swapchain: false,
+            previous_frame_end: None,
             todo_list,
             input_text: String::new(),
-            filter: Filter::All,
+            selected: 0,
             data_path,
-            recreate_swapchain: false,
-            previous_frame_end: Some(sync::now(context.device().clone()).boxed()),
+            window: None,
         }
     }
 
-    fn ensure_gui(&mut self, window_id: WindowId) {
-        if self.gui.is_none() {
-            let window = self.windows.get_window(window_id).unwrap();
-            let renderer = self.windows.get_renderer(window_id).unwrap();
-            self.gui = Some(Gui::new(
-                window,
-                renderer.swapchain_format(),
-                renderer.graphics_queue(),
-                renderer.subpass(),
-                GuiConfig {
-                    is_overlay: false,
-                    ..Default::default()
-                },
-            ));
-        }
-    }
-
-    // egui 0.31 API: panels take &Context, not &mut Ui (for 0.36 it would be Panel::top)
-    fn ui(&mut self, ctx: &Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("⚡ Vulkan Todo").size(22.0).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (total, done) = self.todo_list.stats();
-                    ui.label(format!("{done}/{total} done"));
-                    if ui.button("Clear completed").clicked() {
-                        self.todo_list.clear_completed();
-                        self.todo_list.save_to_file(&self.data_path);
-                    }
-                });
-            });
+    fn init_vulkan(&mut self, event_loop: &ActiveEventLoop) {
+        // Fix for macOS: need ext_metal_surface extension
+        // Recreate instance with required surface extensions from winit
+        let library = VulkanLibrary::new().unwrap();
+        let required_extensions = Surface::required_extensions(event_loop).unwrap_or_else(|_| {
+            // Fallback for when required_extensions fails: manually enable common surface extensions
+            let mut ext = vulkano::instance::InstanceExtensions::empty();
+            ext.khr_surface = true;
+            ext.ext_metal_surface = true;
+            ext.khr_portability_enumeration = true;
+            ext
         });
+        // Also ensure portability enumeration is set for MoltenVK
+        let mut enabled_extensions = required_extensions;
+        enabled_extensions.khr_portability_enumeration = true;
 
-        egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.input_text)
-                        .hint_text("What needs to be done? (Vulkan-powered)")
-                        .desired_width(ui.available_width() - 110.0),
-                );
-                let add_clicked = ui
-                    .add_sized([100.0, 28.0], egui::Button::new("Add + Enter"))
-                    .clicked()
-                    || (response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                        && !self.input_text.trim().is_empty());
+        let instance = Instance::new(
+            library,
+            InstanceCreateInfo {
+                flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                enabled_extensions,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        self.instance = instance;
 
-                if add_clicked {
-                    self.todo_list.add(self.input_text.clone());
-                    self.input_text.clear();
-                    self.todo_list.save_to_file(&self.data_path);
-                }
-            });
-            ui.add_space(6.0);
-        });
-
-        CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.filter, Filter::All, "All");
-                ui.selectable_value(&mut self.filter, Filter::Active, "Active");
-                ui.selectable_value(&mut self.filter, Filter::Completed, "Completed");
-                ui.separator();
-                ui.label(
-                    RichText::new(format!(
-                        "GPU: {}",
-                        self.context
-                            .device()
-                            .physical_device()
-                            .properties()
-                            .device_name
-                    ))
-                    .weak()
-                    .size(11.0),
-                );
-            });
-            ui.separator();
-
-            ScrollArea::vertical().show(ui, |ui| {
-                let mut to_toggle: Option<u64> = None;
-                let mut to_remove: Option<u64> = None;
-
-                let filtered: Vec<_> = self
-                    .todo_list
-                    .items
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title(Self::title(
+                            &self.todo_list,
+                            &self.input_text,
+                            self.selected,
+                        ))
+                        .with_inner_size(winit::dpi::LogicalSize::new(900, 700)),
+                )
+                .unwrap(),
+        );
+        self.window = Some(window.clone());
+        let surface = Surface::from_window(self.instance.clone(), window.clone()).unwrap();
+        let device_extensions = DeviceExtensions {
+            khr_swapchain: true,
+            ..DeviceExtensions::empty()
+        };
+        let (physical_device, queue_family_index) = self
+            .instance
+            .enumerate_physical_devices()
+            .unwrap()
+            .filter(|p| p.supported_extensions().contains(&device_extensions))
+            .filter_map(|p| {
+                p.queue_family_properties()
                     .iter()
-                    .filter(|item| match self.filter {
-                        Filter::All => true,
-                        Filter::Active => !item.done,
-                        Filter::Completed => item.done,
+                    .enumerate()
+                    .position(|(i, q)| {
+                        q.queue_flags.intersects(QueueFlags::GRAPHICS)
+                            && p.surface_support(i as u32, &surface).unwrap_or(false)
                     })
-                    .cloned()
-                    .collect();
+                    .map(|i| (p, i as u32))
+            })
+            .min_by_key(|(p, _)| match p.properties().device_type {
+                PhysicalDeviceType::DiscreteGpu => 0,
+                PhysicalDeviceType::IntegratedGpu => 1,
+                _ => 2,
+            })
+            .unwrap();
 
-                if filtered.is_empty() {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(40.0);
-                        ui.label(
-                            RichText::new("No tasks here. Add one below!")
-                                .size(16.0)
-                                .weak(),
-                        );
-                    });
-                }
+        println!(
+            "Vulkan device: {}",
+            physical_device.properties().device_name
+        );
+        let (device, mut queues) = Device::new(
+            physical_device,
+            DeviceCreateInfo {
+                queue_create_infos: vec![QueueCreateInfo {
+                    queue_family_index,
+                    ..Default::default()
+                }],
+                enabled_extensions: device_extensions,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let queue = queues.next().unwrap();
+        let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
+            device.clone(),
+            StandardCommandBufferAllocatorCreateInfo::default(),
+        ));
+        let caps = device
+            .physical_device()
+            .surface_capabilities(&surface, Default::default())
+            .unwrap();
+        let format = device
+            .physical_device()
+            .surface_formats(&surface, Default::default())
+            .unwrap()[0]
+            .0;
+        let (swapchain, images) = Swapchain::new(
+            device.clone(),
+            surface.clone(),
+            SwapchainCreateInfo {
+                min_image_count: caps.min_image_count.max(2),
+                image_format: format,
+                image_extent: window.inner_size().into(),
+                image_usage: ImageUsage::COLOR_ATTACHMENT,
+                composite_alpha: caps.supported_composite_alpha.into_iter().next().unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
-                for item in filtered {
-                    ui.horizontal(|ui| {
-                        let mut checked = item.done;
-                        if ui.checkbox(&mut checked, "").changed() {
-                            to_toggle = Some(item.id);
-                        }
-                        let col = match item.priority {
-                            Priority::High => Color32::RED,
-                            Priority::Medium => Color32::GOLD,
-                            Priority::Low => Color32::LIGHT_GREEN,
-                        };
-                        ui.colored_label(col, "●");
-                        let mut text = RichText::new(&item.text).size(15.0);
-                        if item.done {
-                            text = text.strikethrough().weak();
-                        }
-                        ui.label(text);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("🗑").clicked() {
-                                to_remove = Some(item.id);
-                            }
-                            ui.label(
-                                RichText::new(item.created_at.format("%H:%M").to_string())
-                                    .weak()
-                                    .size(11.0),
-                            );
-                        });
-                    });
-                    ui.separator();
+        let render_pass = vulkano::single_pass_renderpass!(
+            device.clone(),
+            attachments: {
+                color: {
+                    format: format,
+                    samples: 1,
+                    load_op: Clear,
+                    store_op: Store,
                 }
+            },
+            pass: {
+                color: [color],
+                depth_stencil: {}
+            }
+        )
+        .unwrap();
 
-                if let Some(id) = to_toggle {
-                    self.todo_list.toggle(id);
-                    self.todo_list.save_to_file(&self.data_path);
-                }
-                if let Some(id) = to_remove {
-                    self.todo_list.remove(id);
-                    self.todo_list.save_to_file(&self.data_path);
-                }
-            });
-        });
+        let vs = vs::load(device.clone()).unwrap();
+        let fs = fs::load(device.clone()).unwrap();
+        let pipeline = {
+            let stages = [
+                PipelineShaderStageCreateInfo::new(vs.entry_point("main").unwrap()),
+                PipelineShaderStageCreateInfo::new(fs.entry_point("main").unwrap()),
+            ];
+            let layout = PipelineLayout::new(
+                device.clone(),
+                PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+                    .into_pipeline_layout_create_info(device.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+            let subpass = Subpass::from(render_pass.clone(), 0).unwrap();
+            GraphicsPipeline::new(
+                device.clone(),
+                None,
+                GraphicsPipelineCreateInfo {
+                    stages: stages.into_iter().collect(),
+                    vertex_input_state: Some(
+                        MyVertex::per_vertex()
+                            .definition(&vs.entry_point("main").unwrap())
+                            .unwrap(),
+                    ),
+                    input_assembly_state: Some(InputAssemblyState::default()),
+                    viewport_state: Some(ViewportState::default()),
+                    rasterization_state: Some(RasterizationState::default()),
+                    multisample_state: Some(MultisampleState::default()),
+                    color_blend_state: Some(ColorBlendState::with_attachment_states(
+                        subpass.num_color_attachments(),
+                        ColorBlendAttachmentState::default(),
+                    )),
+                    subpass: Some(subpass.into()),
+                    ..GraphicsPipelineCreateInfo::layout(layout)
+                },
+            )
+            .unwrap()
+        };
+
+        let framebuffers = images
+            .iter()
+            .map(|image| {
+                let view = ImageView::new_default(image.clone()).unwrap();
+                Framebuffer::new(
+                    render_pass.clone(),
+                    FramebufferCreateInfo {
+                        attachments: vec![view],
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+
+        self.device = Some(device.clone());
+        self.queue = Some(queue);
+        self.surface = Some(surface);
+        self.swapchain = Some(swapchain);
+        self.swapchain_images = Some(images);
+        self.render_pass = Some(render_pass);
+        self.framebuffers = framebuffers;
+        self.pipeline = Some(pipeline);
+        self.memory_allocator = Some(memory_allocator);
+        self.command_buffer_allocator = Some(command_buffer_allocator);
+        self.previous_frame_end = Some(sync::now(device.clone()).boxed());
+    }
+
+    fn title(list: &TodoList, input: &str, selected: usize) -> String {
+        let (total, done) = list.stats();
+        let sel = list
+            .items
+            .get(selected)
+            .map(|i| i.text.as_str())
+            .unwrap_or("none");
+        format!(
+            "Vulkan Todo [{done}/{total}] Sel:{selected} '{}' | Input:'{}' | Enter=Add UpDown=Sel Space=Toggle Del=Remove",
+            sel.chars().take(20).collect::<String>(),
+            input.chars().take(25).collect::<String>()
+        )
+    }
+
+    fn build_vertices(&self) -> Vec<MyVertex> {
+        let mut verts = Vec::new();
+        let n = self.todo_list.items.len().max(1) as f32;
+        for (i, item) in self.todo_list.items.iter().enumerate() {
+            let y_top = 0.9 - (i as f32 / n) * 1.8;
+            let y_bottom = y_top - (1.4 / n);
+            let (x_left, x_right) = (-0.9, 0.9);
+            let base = if item.done {
+                [0.2, 0.8, 0.3]
+            } else {
+                [0.9, 0.3, 0.3]
+            };
+            let color = if i == self.selected {
+                [base[0] + 0.15, base[1] + 0.15, base[2] + 0.4]
+            } else {
+                base
+            };
+            verts.extend_from_slice(&[
+                MyVertex {
+                    position: [x_left, y_top],
+                    color,
+                },
+                MyVertex {
+                    position: [x_right, y_top],
+                    color,
+                },
+                MyVertex {
+                    position: [x_left, y_bottom],
+                    color,
+                },
+                MyVertex {
+                    position: [x_right, y_top],
+                    color,
+                },
+                MyVertex {
+                    position: [x_right, y_bottom],
+                    color,
+                },
+                MyVertex {
+                    position: [x_left, y_bottom],
+                    color,
+                },
+            ]);
+        }
+        let w = (self.input_text.len() as f32 * 0.02).min(0.8);
+        verts.extend_from_slice(&[
+            MyVertex {
+                position: [-0.9, -0.95],
+                color: [0.3, 0.3, 0.9],
+            },
+            MyVertex {
+                position: [-0.9 + w, -0.95],
+                color: [0.3, 0.3, 0.9],
+            },
+            MyVertex {
+                position: [-0.9, -0.85],
+                color: [0.3, 0.3, 0.9],
+            },
+            MyVertex {
+                position: [-0.9 + w, -0.95],
+                color: [0.3, 0.3, 0.9],
+            },
+            MyVertex {
+                position: [-0.9 + w, -0.85],
+                color: [0.3, 0.3, 0.9],
+            },
+            MyVertex {
+                position: [-0.9, -0.85],
+                color: [0.3, 0.3, 0.9],
+            },
+        ]);
+        verts
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // vulkano-util 0.35 API: create_window(event_loop, context, descriptor, swapchain_config_fn)
-        let _id = self.windows.create_window(
-            event_loop,
-            self.context.clone(),
-            &WindowDescriptor {
-                title: "Vulkan Todo - Rust + Vulkan".to_string(),
-                width: 900.0,
-                height: 700.0,
-                present_mode: PresentMode::Fifo,
-                ..Default::default()
-            },
-            |_| {},
-        );
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        if let Some(gui) = self.gui.as_mut() {
-            let _consumed = gui.update(&event);
+        if self.surface.is_none() {
+            self.init_vulkan(event_loop);
         }
-
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
                 self.todo_list.save_to_file(&self.data_path);
                 event_loop.exit();
             }
-            WindowEvent::Resized(_) => {
-                self.recreate_swapchain = true;
+            WindowEvent::Resized(_) => self.recreate_swapchain = true,
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key,
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                match logical_key {
+                    Key::Named(NamedKey::Enter) => {
+                        if !self.input_text.trim().is_empty() {
+                            self.todo_list.add(self.input_text.clone());
+                            self.input_text.clear();
+                            self.todo_list.save_to_file(&self.data_path);
+                        }
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        self.input_text.pop();
+                    }
+                    Key::Named(NamedKey::Delete) => {
+                        self.todo_list.remove(self.selected);
+                        if self.selected > 0 && self.selected >= self.todo_list.items.len() {
+                            self.selected -= 1;
+                        }
+                        self.todo_list.save_to_file(&self.data_path);
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        if self.selected > 0 {
+                            self.selected -= 1;
+                        }
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        if self.selected + 1 < self.todo_list.items.len() {
+                            self.selected += 1;
+                        }
+                    }
+                    Key::Named(NamedKey::Space) => {
+                        self.todo_list.toggle(self.selected);
+                        self.todo_list.save_to_file(&self.data_path);
+                    }
+                    Key::Named(NamedKey::Escape) => self.input_text.clear(),
+                    Key::Character(s) => self.input_text.push_str(&s),
+                    _ => {}
+                }
+                if let Some(win) = &self.window {
+                    win.set_title(&Self::title(
+                        &self.todo_list,
+                        &self.input_text,
+                        self.selected,
+                    ));
+                }
+                println!(
+                    "TODO: {:?} | INPUT: '{}' | SEL:{}",
+                    self.todo_list
+                        .items
+                        .iter()
+                        .map(|i| format!("{}[{}]", i.text, if i.done { "x" } else { " " }))
+                        .collect::<Vec<_>>(),
+                    self.input_text,
+                    self.selected
+                );
             }
             WindowEvent::RedrawRequested => {
-                self.ensure_gui(window_id);
-                let renderer = self.windows.get_renderer_mut(window_id).unwrap();
-
+                if self.swapchain.is_none() {
+                    return;
+                }
                 if self.recreate_swapchain {
-                    renderer.resize();
+                    let window = self.window.as_ref().unwrap();
+                    let (new_swapchain, new_images) = self
+                        .swapchain
+                        .as_ref()
+                        .unwrap()
+                        .recreate(SwapchainCreateInfo {
+                            image_extent: window.inner_size().into(),
+                            ..self.swapchain.as_ref().unwrap().create_info()
+                        })
+                        .unwrap();
+                    let render_pass = self.render_pass.as_ref().unwrap().clone();
+                    let fbs = new_images
+                        .iter()
+                        .map(|img| {
+                            let view = ImageView::new_default(img.clone()).unwrap();
+                            Framebuffer::new(
+                                render_pass.clone(),
+                                FramebufferCreateInfo {
+                                    attachments: vec![view],
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    self.swapchain = Some(new_swapchain);
+                    self.swapchain_images = Some(new_images);
+                    self.framebuffers = fbs;
                     self.recreate_swapchain = false;
                 }
-
-                let gui = self.gui.as_mut().unwrap();
-                gui.immediate_ui(|gui| {
-                    let ctx = gui.context().clone();
-                    self.ui(&ctx);
-                });
-
-                let before = self.previous_frame_end.take().unwrap();
-                let after = renderer.acquire(None, |_| {}).unwrap();
-                let cb = renderer.draw(None, |builder| {
-                    gui.draw(builder);
-                });
-
-                let future = before
-                    .join(after)
-                    .then_execute(renderer.graphics_queue(), cb)
+                let (image_i, suboptimal, acquire_future) =
+                    match acquire_next_image(self.swapchain.clone().unwrap(), None) {
+                        Ok(r) => r,
+                        Err(vulkano::Validated::Error(vulkano::VulkanError::OutOfDate)) => {
+                            self.recreate_swapchain = true;
+                            return;
+                        }
+                        Err(e) => panic!("acquire: {e}"),
+                    };
+                if suboptimal {
+                    self.recreate_swapchain = true;
+                }
+                let vertices = self.build_vertices();
+                let vertex_buffer = Buffer::from_iter(
+                    self.memory_allocator.as_ref().unwrap().clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::VERTEX_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    vertices,
+                )
+                .unwrap();
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    self.command_buffer_allocator.as_ref().unwrap().clone(),
+                    self.queue.as_ref().unwrap().queue_family_index(),
+                    CommandBufferUsage::OneTimeSubmit,
+                )
+                .unwrap();
+                let (_, done) = self.todo_list.stats();
+                let ratio = if self.todo_list.items.is_empty() {
+                    0.0
+                } else {
+                    done as f32 / self.todo_list.items.len() as f32
+                };
+                let clear = [0.05 * (1.0 - ratio), 0.05 + 0.15 * ratio, 0.12];
+                builder
+                    .begin_render_pass(
+                        RenderPassBeginInfo {
+                            clear_values: vec![Some(clear.into())],
+                            ..RenderPassBeginInfo::framebuffer(
+                                self.framebuffers[image_i as usize].clone(),
+                            )
+                        },
+                        Default::default(),
+                    )
+                    .unwrap()
+                    .set_viewport(
+                        0,
+                        smallvec![Viewport {
+                            offset: [0.0, 0.0],
+                            extent: self.window.as_ref().unwrap().inner_size().into(),
+                            depth_range: 0.0..=1.0,
+                        }],
+                    )
+                    .unwrap()
+                    .bind_pipeline_graphics(self.pipeline.as_ref().unwrap().clone())
+                    .unwrap()
+                    .bind_vertex_buffers(0, vertex_buffer.clone())
+                    .unwrap();
+                unsafe { builder.draw(vertex_buffer.len() as u32, 1, 0, 0) }.unwrap();
+                builder.end_render_pass(Default::default()).unwrap();
+                let command_buffer = builder.build().unwrap();
+                let future = self
+                    .previous_frame_end
+                    .take()
+                    .unwrap()
+                    .join(acquire_future)
+                    .then_execute(self.queue.as_ref().unwrap().clone(), command_buffer)
                     .unwrap()
                     .then_swapchain_present(
-                        renderer.graphics_queue(),
-                        vulkano::swapchain::SwapchainPresentInfo::swapchain_image_index(
-                            renderer.swapchain(),
-                            renderer.image_index(),
+                        self.queue.as_ref().unwrap().clone(),
+                        SwapchainPresentInfo::swapchain_image_index(
+                            self.swapchain.clone().unwrap(),
+                            image_i,
                         ),
                     )
                     .then_signal_fence_and_flush();
-
-                match future {
-                    Ok(f) => self.previous_frame_end = Some(f.boxed()),
+                match future.map(|f| f.boxed()) {
+                    Ok(f) => self.previous_frame_end = Some(f),
                     Err(vulkano::Validated::Error(vulkano::VulkanError::OutOfDate)) => {
                         self.recreate_swapchain = true;
                         self.previous_frame_end =
-                            Some(sync::now(self.context.device().clone()).boxed());
+                            Some(sync::now(self.device.as_ref().unwrap().clone()).boxed());
                     }
                     Err(e) => {
-                        eprintln!("Failed to flush future: {e}");
+                        eprintln!("flush: {e}");
                         self.previous_frame_end =
-                            Some(sync::now(self.context.device().clone()).boxed());
+                            Some(sync::now(self.device.as_ref().unwrap().clone()).boxed());
                     }
                 }
             }
             _ => {}
         }
-
-        if let Some(window) = self.windows.get_window(window_id) {
-            window.request_redraw();
+        if let Some(win) = &self.window {
+            win.request_redraw();
         }
     }
-
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        for (_, renderer) in self.windows.iter() {
-            renderer.window().request_redraw();
+        if let Some(win) = &self.window {
+            win.request_redraw();
         }
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::new()?;
     let mut app = App::new();
     event_loop.run_app(&mut app)?;
     Ok(())
